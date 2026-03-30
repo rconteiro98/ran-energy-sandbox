@@ -1,0 +1,8 @@
+site_id,site_name,site_type,latitude,longitude
+S001,Gower Street Rooftop,rooftop,51.5248,-0.1337
+S002,Torrington Place Corner,street_furniture,51.5254,-0.1362
+S003,Euston Road Block,rooftop,51.5281,-0.1325
+S004,Brunswick Square Edge,rooftop,51.5240,-0.1258
+S005,Russell Square South,street_furniture,51.5212,-0.1239
+S006,King's Cross Fringe,rooftop,51.5318,-0.1230
+S007,Holborn Fringe,rooftop,51.5175,-0.1202
