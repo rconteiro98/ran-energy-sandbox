@@ -71,8 +71,14 @@ def load_simulated_kpis(input_path: str | Path = DEFAULT_INPUT_PATH) -> pd.DataF
     )
 
 
-def build_feature_matrix(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """Return model features and target using simple deterministic encoding."""
+def encode_model_features(dataset: pd.DataFrame) -> pd.DataFrame:
+    """Return the deterministic encoded feature frame used by the model."""
+
+    missing_columns = [
+        column_name for column_name in FEATURE_COLUMNS if column_name not in dataset.columns
+    ]
+    if missing_columns:
+        raise ValueError(f"Missing feature columns: {missing_columns}")
 
     feature_frame = dataset[FEATURE_COLUMNS].copy()
     feature_frame["is_weekend"] = feature_frame["is_weekend"].astype(int)
@@ -86,7 +92,16 @@ def build_feature_matrix(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series
         [feature_frame.drop(columns=["site_id"]), site_dummies],
         axis=1,
     )
+    return feature_frame
 
+
+def build_feature_matrix(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Return model features and target using simple deterministic encoding."""
+
+    if TARGET_COLUMN not in dataset.columns:
+        raise ValueError(f"Missing target column: {TARGET_COLUMN}")
+
+    feature_frame = encode_model_features(dataset)
     target = dataset[TARGET_COLUMN].copy()
     return feature_frame, target
 
@@ -199,19 +214,37 @@ def build_predictions_frame(
     return predictions
 
 
-def train_and_evaluate_model(
-    input_path: str | Path = DEFAULT_INPUT_PATH,
-    predictions_output_path: str | Path = DEFAULT_PREDICTIONS_PATH,
-    coefficients_output_path: str | Path = DEFAULT_COEFFICIENTS_PATH,
-) -> dict[str, pd.DataFrame | dict[str, float] | pd.Series]:
-    """Train the linear regression model, save outputs, and return results."""
+def save_training_outputs(
+    predictions_frame: pd.DataFrame,
+    coefficient_frame: pd.DataFrame,
+    predictions_output_path: str | Path,
+    coefficients_output_path: str | Path,
+) -> None:
+    """Persist the compact prediction and coefficient outputs to CSV."""
 
-    dataset = load_simulated_kpis(input_path=input_path)
-    feature_frame, target = build_feature_matrix(dataset)
+    predictions_output_path = Path(predictions_output_path)
+    coefficients_output_path = Path(coefficients_output_path)
+    predictions_output_path.parent.mkdir(parents=True, exist_ok=True)
+    coefficients_output_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions_frame.to_csv(predictions_output_path, index=False)
+    coefficient_frame.to_csv(coefficients_output_path, index=False)
+
+
+def train_and_evaluate_model_from_frame(
+    dataset: pd.DataFrame,
+    predictions_output_path: str | Path | None = None,
+    coefficients_output_path: str | Path | None = None,
+) -> dict[str, pd.DataFrame | dict[str, float] | pd.Series]:
+    """Train the linear regression model from an in-memory KPI dataframe."""
+
+    ordered_dataset = dataset.sort_values(["timestamp", "site_id"], kind="stable").reset_index(
+        drop=True
+    )
+    feature_frame, target = build_feature_matrix(ordered_dataset)
     split_results = split_train_test_by_time(
         feature_frame=feature_frame,
         target=target,
-        timestamps=dataset["timestamp"],
+        timestamps=ordered_dataset["timestamp"],
     )
 
     coefficients = fit_linear_regression(
@@ -232,28 +265,87 @@ def train_and_evaluate_model(
         coefficients=coefficients,
     )
 
-    test_mask = dataset["timestamp"] >= split_results["split_timestamp"].iloc[0]
+    test_mask = ordered_dataset["timestamp"] >= split_results["split_timestamp"].iloc[0]
     predictions_frame = build_predictions_frame(
-        dataset=dataset,
-        test_index=dataset.index[test_mask],
+        dataset=ordered_dataset,
+        test_index=ordered_dataset.index[test_mask],
         y_true=split_results["y_test"],
         y_pred=test_predictions,
     )
 
-    predictions_output_path = Path(predictions_output_path)
-    coefficients_output_path = Path(coefficients_output_path)
-    predictions_output_path.parent.mkdir(parents=True, exist_ok=True)
-    coefficients_output_path.parent.mkdir(parents=True, exist_ok=True)
-    predictions_frame.to_csv(predictions_output_path, index=False)
-    coefficient_frame.to_csv(coefficients_output_path, index=False)
+    if predictions_output_path is not None and coefficients_output_path is not None:
+        save_training_outputs(
+            predictions_frame=predictions_frame,
+            coefficient_frame=coefficient_frame,
+            predictions_output_path=predictions_output_path,
+            coefficients_output_path=coefficients_output_path,
+        )
 
     return {
-        "dataset": dataset,
+        "dataset": ordered_dataset,
         "metrics": metrics,
         "coefficients": coefficient_frame,
         "predictions": predictions_frame,
         "split_timestamp": split_results["split_timestamp"],
     }
+
+
+def train_and_evaluate_model(
+    input_path: str | Path = DEFAULT_INPUT_PATH,
+    predictions_output_path: str | Path = DEFAULT_PREDICTIONS_PATH,
+    coefficients_output_path: str | Path = DEFAULT_COEFFICIENTS_PATH,
+) -> dict[str, pd.DataFrame | dict[str, float] | pd.Series]:
+    """Train the linear regression model, save outputs, and return results."""
+
+    dataset = load_simulated_kpis(input_path=input_path)
+    return train_and_evaluate_model_from_frame(
+        dataset=dataset,
+        predictions_output_path=predictions_output_path,
+        coefficients_output_path=coefficients_output_path,
+    )
+
+
+def align_feature_frame(
+    feature_frame: pd.DataFrame, required_feature_columns: list[str]
+) -> pd.DataFrame:
+    """Align an encoded feature frame to the exact columns used during training."""
+
+    aligned_frame = feature_frame.copy()
+    for column_name in required_feature_columns:
+        if column_name not in aligned_frame.columns:
+            aligned_frame[column_name] = 0.0
+
+    return aligned_frame[required_feature_columns].astype(float)
+
+
+def predict_dataset_energy(
+    dataset: pd.DataFrame, coefficient_frame: pd.DataFrame
+) -> pd.DataFrame:
+    """Predict energy usage for a KPI dataframe using learned coefficients."""
+
+    if coefficient_frame.empty:
+        raise ValueError("coefficient_frame must not be empty")
+
+    ordered_coefficients = coefficient_frame.reset_index(drop=True)
+    if str(ordered_coefficients.loc[0, "feature"]) != "intercept":
+        raise ValueError("coefficient_frame must start with the intercept row")
+
+    required_feature_columns = (
+        ordered_coefficients.loc[ordered_coefficients["feature"] != "intercept", "feature"]
+        .astype(str)
+        .tolist()
+    )
+    encoded_features = encode_model_features(dataset)
+    aligned_features = align_feature_frame(encoded_features, required_feature_columns)
+    coefficients = ordered_coefficients["coefficient"].astype(float).to_numpy()
+    predicted_energy = predict_linear_regression(
+        feature_frame=aligned_features,
+        coefficients=coefficients,
+    )
+
+    prediction_frame = dataset.copy()
+    prediction_frame["predicted_energy_watts"] = np.round(predicted_energy, 2)
+    return prediction_frame
 
 
 def print_training_summary(

@@ -3,16 +3,21 @@
 from importlib import import_module
 
 __all__ = [
+    "align_feature_frame",
+    "build_coefficients_frame",
     "DEFAULT_COEFFICIENTS_PATH",
     "DEFAULT_INPUT_PATH",
     "DEFAULT_PREDICTIONS_PATH",
     "build_feature_matrix",
     "compute_metrics",
+    "encode_model_features",
     "fit_linear_regression",
     "load_simulated_kpis",
+    "predict_dataset_energy",
     "predict_linear_regression",
     "split_train_test_by_time",
     "train_and_evaluate_model",
+    "train_and_evaluate_model_from_frame",
 ]
 
 

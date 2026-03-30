@@ -18,8 +18,14 @@ from src.geo import (
     STUDY_RADIUS_METERS,
     load_study_area_sites,
 )
+from src.ml import predict_dataset_energy, train_and_evaluate_model_from_frame
 from src.rules import apply_tower_power_rules
-from src.sim import build_live_kpi_snapshot
+from src.sim import (
+    DEFAULT_RANDOM_SEED,
+    DEFAULT_START_TIMESTAMP,
+    build_live_kpi_snapshot,
+    generate_simulated_kpis,
+)
 
 
 st.set_page_config(page_title="UCL RAN Energy Sandbox", layout="wide")
@@ -28,6 +34,9 @@ DEFAULT_SITE_COLOR = [117, 117, 117, 210]
 STUDY_RADIUS_COLOR = [255, 152, 0, 160]
 CAMPUS_CENTER_COLOR = [220, 53, 69, 220]
 STATE_LABELS = {"ON": "green", "OFF": "red"}
+LIVE_VIEW_LABEL = "Live Control"
+SIMULATION_VIEW_LABEL = "Simulation & ML"
+DEFAULT_FORECAST_DAYS = 7
 
 
 def build_campus_dataframe() -> pd.DataFrame:
@@ -55,14 +64,6 @@ def add_tower_state_colors(site_states: pd.DataFrame) -> pd.DataFrame:
         lambda color: color if isinstance(color, list) else DEFAULT_SITE_COLOR
     )
     return display_sites
-
-
-def format_distance(value: float | None) -> str:
-    """Return a readable metric string for a distance value in meters."""
-
-    if value is None or pd.isna(value):
-        return "N/A"
-    return f"{value:.1f} m"
 
 
 def build_study_radius_layer() -> pdk.Layer:
@@ -178,10 +179,14 @@ def filter_sites_by_type(
 
 
 def render_metrics(filtered_sites: pd.DataFrame) -> None:
-    """Render a compact summary section above the map."""
+    """Render a compact summary section above the live map."""
 
-    on_sites = int((filtered_sites["tower_state"] == "ON").sum()) if not filtered_sites.empty else 0
-    off_sites = int((filtered_sites["tower_state"] == "OFF").sum()) if not filtered_sites.empty else 0
+    on_sites = (
+        int((filtered_sites["tower_state"] == "ON").sum()) if not filtered_sites.empty else 0
+    )
+    off_sites = (
+        int((filtered_sites["tower_state"] == "OFF").sum()) if not filtered_sites.empty else 0
+    )
     controlled_energy = (
         filtered_sites["controlled_energy_watts"].sum() if not filtered_sites.empty else 0.0
     )
@@ -275,13 +280,247 @@ def render_tower_cards(filtered_sites: pd.DataFrame) -> None:
         )
 
 
-def main() -> None:
-    """Render the dashboard using simulated live KPIs and rule-based control."""
+def merge_site_metadata(
+    kpi_frame: pd.DataFrame, study_area_sites: pd.DataFrame
+) -> pd.DataFrame:
+    """Attach explicit site metadata to a KPI frame for display purposes."""
 
-    study_area_sites = load_study_area_sites()
+    metadata_columns = [
+        "site_id",
+        "site_name",
+        "site_type",
+        "latitude",
+        "longitude",
+        "distance_to_campus_m",
+    ]
+    metadata = study_area_sites[metadata_columns].drop_duplicates("site_id")
+    merged_frame = kpi_frame.copy()
+    missing_columns = [
+        column_name
+        for column_name in metadata_columns[1:]
+        if column_name not in merged_frame.columns
+    ]
+    if missing_columns:
+        merged_frame = merged_frame.drop(
+            columns=[column_name for column_name in metadata_columns if column_name in merged_frame.columns and column_name != "site_id"],
+            errors="ignore",
+        ).merge(metadata, on="site_id", how="left")
+
+    return merged_frame.sort_values(["timestamp", "site_id"], kind="stable").reset_index(
+        drop=True
+    )
+
+
+def clear_simulation_ml_state() -> None:
+    """Remove model results that depend on the current simulation controls."""
+
+    st.session_state.pop("ml_training_results", None)
+    st.session_state.pop("ml_forecast_frame", None)
+    st.session_state.pop("ml_forecast_start", None)
+    st.session_state.pop("ml_forecast_end", None)
+
+
+def build_simulation_start_timestamp(start_date: object) -> str:
+    """Convert the selected date into the hourly simulator timestamp format."""
+
+    return pd.Timestamp(start_date).strftime("%Y-%m-%d 00:00:00")
+
+
+def render_simulation_metrics(simulated_kpis: pd.DataFrame) -> None:
+    """Render a compact summary for the simulated KPI dataset."""
+
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Rows", len(simulated_kpis))
+    summary_columns[1].metric("Sites", simulated_kpis["site_id"].nunique())
+    summary_columns[2].metric(
+        "Mean energy",
+        f"{simulated_kpis['energy_watts'].mean():.1f} W",
+    )
+    summary_columns[3].metric(
+        "Peak traffic",
+        f"{simulated_kpis['traffic_mbps'].max():.1f} Mbps",
+    )
+
+    range_columns = st.columns(3)
+    range_columns[0].metric(
+        "Start",
+        simulated_kpis["timestamp"].min().strftime("%Y-%m-%d %H:%M"),
+    )
+    range_columns[1].metric(
+        "End",
+        simulated_kpis["timestamp"].max().strftime("%Y-%m-%d %H:%M"),
+    )
+    range_columns[2].metric("Study radius", f"{STUDY_RADIUS_METERS} m")
+
+
+def render_simulation_charts(simulated_kpis: pd.DataFrame) -> None:
+    """Render simple visual summaries of the simulated KPI dataset."""
+
+    total_energy = (
+        simulated_kpis.groupby("timestamp", as_index=True)["energy_watts"]
+        .sum()
+        .to_frame("total_energy_watts")
+    )
+    per_site_energy = simulated_kpis.pivot(
+        index="timestamp",
+        columns="site_id",
+        values="energy_watts",
+    )
+    total_users = (
+        simulated_kpis.groupby("timestamp", as_index=True)["active_users"]
+        .sum()
+        .to_frame("total_active_users")
+    )
+
+    chart_columns = st.columns(2)
+    chart_columns[0].subheader("Total Simulated Energy")
+    chart_columns[0].line_chart(total_energy, use_container_width=True)
+    chart_columns[1].subheader("Total Simulated Users")
+    chart_columns[1].line_chart(total_users, use_container_width=True)
+
+    st.subheader("Per-Site Simulated Energy")
+    st.line_chart(per_site_energy, use_container_width=True)
+
+
+def render_simulated_kpi_table(simulated_kpis: pd.DataFrame) -> None:
+    """Render the detailed simulated KPI table."""
+
+    st.subheader("Simulated KPI Table")
+    st.dataframe(
+        simulated_kpis[
+            [
+                "timestamp",
+                "site_id",
+                "site_name",
+                "site_type",
+                "active_users",
+                "traffic_mbps",
+                "prb_utilization",
+                "avg_sinr",
+                "energy_watts",
+                "hour_of_day",
+                "is_weekend",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_training_results(training_results: dict[str, object]) -> None:
+    """Render model metrics, coefficients, and fit plots."""
+
+    metrics = training_results["metrics"]
+    coefficients = training_results["coefficients"]
+    predictions = training_results["predictions"]
+    split_timestamp = training_results["split_timestamp"].iloc[0]
+
+    st.subheader("Linear Regression Training")
+    st.caption(
+        "The model is multivariate, so the clearest fit views are actual-vs-predicted "
+        "comparisons and test-period time series rather than a single regression line."
+    )
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Train/test split", str(split_timestamp))
+    metric_columns[1].metric("MAE", f"{metrics['mae']:.2f} W")
+    metric_columns[2].metric("RMSE", f"{metrics['rmse']:.2f} W")
+    metric_columns[3].metric("R2", f"{metrics['r2']:.4f}")
+
+    comparison_frame = (
+        predictions.groupby("timestamp", as_index=True)[
+            ["actual_energy_watts", "predicted_energy_watts"]
+        ]
+        .sum()
+        .rename(
+            columns={
+                "actual_energy_watts": "actual_total_watts",
+                "predicted_energy_watts": "predicted_total_watts",
+            }
+        )
+    )
+
+    chart_columns = st.columns(2)
+    chart_columns[0].subheader("Test Period Total Watts")
+    chart_columns[0].line_chart(comparison_frame, use_container_width=True)
+    chart_columns[1].subheader("Actual vs Predicted Scatter")
+    chart_columns[1].scatter_chart(
+        predictions,
+        x="actual_energy_watts",
+        y="predicted_energy_watts",
+        use_container_width=True,
+    )
+
+    table_columns = st.columns(2)
+    table_columns[0].subheader("Learned Coefficients")
+    table_columns[0].dataframe(coefficients, use_container_width=True, hide_index=True)
+    table_columns[1].subheader("Prediction Sample")
+    table_columns[1].dataframe(
+        predictions.head(20),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_forecast_results(forecast_frame: pd.DataFrame) -> None:
+    """Render the next-week energy forecast outputs."""
+
+    st.subheader("Next-Week Energy Forecast")
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Forecast rows", len(forecast_frame))
+    metric_columns[1].metric("Forecast sites", forecast_frame["site_id"].nunique())
+    metric_columns[2].metric(
+        "Mean predicted watts",
+        f"{forecast_frame['predicted_energy_watts'].mean():.1f} W",
+    )
+    metric_columns[3].metric(
+        "Peak predicted watts",
+        f"{forecast_frame['predicted_energy_watts'].max():.1f} W",
+    )
+
+    total_forecast = (
+        forecast_frame.groupby("timestamp", as_index=True)["predicted_energy_watts"]
+        .sum()
+        .to_frame("total_predicted_watts")
+    )
+    per_site_forecast = forecast_frame.pivot(
+        index="timestamp",
+        columns="site_id",
+        values="predicted_energy_watts",
+    )
+
+    chart_columns = st.columns(2)
+    chart_columns[0].subheader("Total Forecast Watts")
+    chart_columns[0].line_chart(total_forecast, use_container_width=True)
+    chart_columns[1].subheader("Per-Site Forecast Watts")
+    chart_columns[1].line_chart(per_site_forecast, use_container_width=True)
+
+    st.dataframe(
+        forecast_frame[
+            [
+                "timestamp",
+                "site_id",
+                "site_name",
+                "site_type",
+                "active_users",
+                "traffic_mbps",
+                "prb_utilization",
+                "avg_sinr",
+                "predicted_energy_watts",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_live_view(study_area_sites: pd.DataFrame) -> None:
+    """Render the current live-control dashboard view."""
+
     initialize_live_state(study_area_sites)
 
-    st.sidebar.header("Filters")
+    st.sidebar.header("Live controls")
     selected_site_types = build_site_type_filter(study_area_sites)
     live_auto_refresh = st.sidebar.toggle("Live auto-refresh", value=False)
     refresh_seconds = st.sidebar.slider("Refresh interval (seconds)", 1, 10, 3)
@@ -301,11 +540,10 @@ def main() -> None:
     table_sites["distance_to_campus_m"] = table_sites["distance_to_campus_m"].round(1)
     map_sites = add_tower_state_colors(table_sites)
 
-    st.title("UCL RAN Energy Sandbox")
     st.write(
         "Approximate candidate sites within the Bloomsbury study radius around UCL. "
-        "This dashboard now simulates live KPIs and applies a simple rule-based "
-        "tower ON/OFF controller."
+        "This dashboard simulates live KPIs and applies a simple rule-based tower "
+        "ON/OFF controller."
     )
     st.caption(
         "Green means the tower is ON. Red means the tower is in low-load sleep mode."
@@ -339,6 +577,122 @@ def main() -> None:
         time.sleep(refresh_seconds)
         advance_live_state(study_area_sites)
         st.rerun()
+
+
+def render_simulation_ml_view(study_area_sites: pd.DataFrame) -> None:
+    """Render the simulation, training, and forecasting dashboard view."""
+
+    st.write(
+        "Use this view to inspect the synthetic KPI dataset, train the baseline "
+        "linear regression model, and forecast next-week tower energy from "
+        "simulated future KPIs."
+    )
+
+    st.sidebar.header("Simulation settings")
+    start_date = st.sidebar.date_input(
+        "Simulation start date",
+        value=pd.Timestamp(DEFAULT_START_TIMESTAMP).date(),
+    )
+    num_days = st.sidebar.slider("Simulation days", 7, 28, 14)
+    random_seed = int(
+        st.sidebar.number_input(
+            "Simulation random seed",
+            min_value=0,
+            value=int(DEFAULT_RANDOM_SEED),
+            step=1,
+        )
+    )
+
+    simulation_signature = (
+        f"{pd.Timestamp(start_date).date().isoformat()}|{num_days}|{random_seed}"
+    )
+    if st.session_state.get("ml_simulation_signature") != simulation_signature:
+        st.session_state["ml_simulation_signature"] = simulation_signature
+        clear_simulation_ml_state()
+
+    simulated_kpis = merge_site_metadata(
+        generate_simulated_kpis(
+            start_timestamp=build_simulation_start_timestamp(start_date),
+            num_days=num_days,
+            random_seed=random_seed,
+        ),
+        study_area_sites,
+    )
+
+    render_simulation_metrics(simulated_kpis)
+    render_simulation_charts(simulated_kpis)
+    render_simulated_kpi_table(simulated_kpis)
+
+    action_columns = st.columns(2)
+    train_model = action_columns[0].button(
+        "Train linear regression",
+        use_container_width=True,
+    )
+    predict_next_week = action_columns[1].button(
+        "Predict next week watts",
+        use_container_width=True,
+        disabled="ml_training_results" not in st.session_state,
+    )
+
+    if train_model:
+        st.session_state["ml_training_results"] = train_and_evaluate_model_from_frame(
+            simulated_kpis
+        )
+        st.session_state.pop("ml_forecast_frame", None)
+        st.session_state.pop("ml_forecast_start", None)
+        st.session_state.pop("ml_forecast_end", None)
+
+    training_results = st.session_state.get("ml_training_results")
+    if training_results is not None:
+        render_training_results(training_results)
+    else:
+        st.info("Train the linear regression model to see fit metrics, coefficients, and plots.")
+
+    if predict_next_week and training_results is not None:
+        forecast_start = pd.Timestamp(simulated_kpis["timestamp"].max()) + pd.Timedelta(hours=1)
+        forecast_frame = merge_site_metadata(
+            generate_simulated_kpis(
+                start_timestamp=forecast_start.strftime("%Y-%m-%d %H:%M:%S"),
+                num_days=DEFAULT_FORECAST_DAYS,
+                random_seed=random_seed,
+            ),
+            study_area_sites,
+        )
+        st.session_state["ml_forecast_frame"] = predict_dataset_energy(
+            forecast_frame,
+            training_results["coefficients"],
+        )
+        st.session_state["ml_forecast_start"] = forecast_start
+        st.session_state["ml_forecast_end"] = forecast_frame["timestamp"].max()
+
+    forecast_frame = st.session_state.get("ml_forecast_frame")
+    if forecast_frame is not None:
+        forecast_start = st.session_state.get("ml_forecast_start")
+        forecast_end = st.session_state.get("ml_forecast_end")
+        if forecast_start is not None and forecast_end is not None:
+            st.caption(
+                "Forecast window: "
+                f"{pd.Timestamp(forecast_start).strftime('%Y-%m-%d %H:%M')} to "
+                f"{pd.Timestamp(forecast_end).strftime('%Y-%m-%d %H:%M')}"
+            )
+        render_forecast_results(forecast_frame)
+
+
+def main() -> None:
+    """Render the dashboard using simulated live KPIs and model experimentation."""
+
+    study_area_sites = load_study_area_sites()
+
+    st.title("UCL RAN Energy Sandbox")
+    selected_view = st.sidebar.radio(
+        "View",
+        options=[LIVE_VIEW_LABEL, SIMULATION_VIEW_LABEL],
+    )
+
+    if selected_view == LIVE_VIEW_LABEL:
+        render_live_view(study_area_sites)
+    else:
+        render_simulation_ml_view(study_area_sites)
 
 
 if __name__ == "__main__":
