@@ -2,7 +2,7 @@
 ucl-ran-energy-sandbox
 
 ## Goal
-Build a modular, interview-ready MVP for RAN energy optimization around the UCL Bloomsbury campus area.
+Build a modular, MVP for RAN energy optimization around the UCL Bloomsbury campus area.
 
 ## Development rules
 - Build one module at a time.

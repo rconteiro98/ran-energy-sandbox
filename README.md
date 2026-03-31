@@ -62,6 +62,10 @@ python -m streamlit run app/streamlit_app.py
 python -m src.ml.train_linear_regression
 ```
 
+## Dashboard Walkthrough
+
+For a step-by-step explanation of the two dashboard views and the key concepts behind them, see [docs/dashboard_views_guide.md](docs/dashboard_views_guide.md).
+
 ## Project Goal
 
 The goal is to build a simple, modular, and explainable sandbox for demonstrating how RAN energy optimization could be explored around a small urban study area before moving to more advanced control logic.

@@ -18,6 +18,16 @@ from src.geo import (
     STUDY_RADIUS_METERS,
     load_study_area_sites,
 )
+from src.llm import (
+    DEFAULT_LOCAL_LLM_ENDPOINT,
+    DEFAULT_LOCAL_LLM_MODEL,
+    LocalLlmError,
+    build_forecast_summary,
+    build_simulation_summary_prompt,
+    build_training_results_summary,
+    generate_local_llm_text,
+    list_local_llm_models,
+)
 from src.ml import predict_dataset_energy, train_and_evaluate_model_from_frame
 from src.rules import apply_tower_power_rules
 from src.sim import (
@@ -37,6 +47,28 @@ STATE_LABELS = {"ON": "green", "OFF": "red"}
 LIVE_VIEW_LABEL = "Live Control"
 SIMULATION_VIEW_LABEL = "Simulation & ML"
 DEFAULT_FORECAST_DAYS = 7
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_simulation_summary(
+    prompt: str,
+    model_name: str,
+    endpoint_url: str,
+) -> str:
+    """Cache local LLM summaries so repeated reruns stay responsive."""
+
+    return generate_local_llm_text(
+        prompt=prompt,
+        model_name=model_name,
+        endpoint_url=endpoint_url,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_local_models(endpoint_url: str) -> list[str]:
+    """Cache installed local model tags for a given endpoint."""
+
+    return list_local_llm_models(endpoint_url=endpoint_url)
 
 
 def build_campus_dataframe() -> pd.DataFrame:
@@ -318,6 +350,99 @@ def clear_simulation_ml_state() -> None:
     st.session_state.pop("ml_forecast_frame", None)
     st.session_state.pop("ml_forecast_start", None)
     st.session_state.pop("ml_forecast_end", None)
+    st.session_state.pop("llm_simulation_summary_requested", None)
+
+
+def render_llm_simulation_summary(
+    training_results: dict[str, object],
+    forecast_frame: pd.DataFrame | None,
+) -> None:
+    """Render an optional local-LLM explanation for training and forecast outputs."""
+
+    st.subheader("Plain-English LLM Summary")
+    st.caption(
+        "This explanation uses summarized metrics only. It does not control the model, "
+        "the forecast, or tower decisions."
+    )
+
+    llm_columns = st.columns(2)
+    endpoint_url = llm_columns[0].text_input(
+        "Local LLM endpoint",
+        value=st.session_state.get("llm_endpoint_url", DEFAULT_LOCAL_LLM_ENDPOINT),
+        key="llm_endpoint_url",
+        help="Expected to be an Ollama-compatible local HTTP endpoint.",
+    ).strip()
+
+    available_models: list[str] = []
+    if endpoint_url:
+        try:
+            available_models = get_cached_local_models(endpoint_url)
+        except LocalLlmError:
+            available_models = []
+
+    stored_model_name = st.session_state.get("llm_model_name", DEFAULT_LOCAL_LLM_MODEL)
+    if available_models:
+        default_model_name = (
+            stored_model_name if stored_model_name in available_models else available_models[0]
+        )
+        default_model_index = available_models.index(default_model_name)
+        model_name = llm_columns[1].selectbox(
+            "Local LLM model",
+            options=available_models,
+            index=default_model_index,
+            key="llm_model_name",
+            help="Detected from the local runtime.",
+        )
+        st.caption(f"Detected local models: {', '.join(available_models)}")
+    else:
+        model_name = llm_columns[1].text_input(
+            "Local LLM model",
+            value=stored_model_name,
+            key="llm_model_name",
+            help="Use the local model tag exposed by your runtime.",
+        ).strip()
+
+    if forecast_frame is None:
+        st.info("Generate the next-week forecast to unlock the combined LLM summary.")
+        return
+
+    generate_summary = st.button(
+        "Summarize training and forecast",
+        use_container_width=True,
+    )
+    if generate_summary:
+        st.session_state["llm_simulation_summary_requested"] = True
+
+    if not st.session_state.get("llm_simulation_summary_requested", False):
+        st.info(
+            "Click the button to generate a short plain-English summary of the training "
+            "results and forecast trends."
+        )
+        return
+
+    if not endpoint_url or not model_name:
+        st.warning("Enter both a local LLM endpoint and a model name.")
+        return
+
+    training_summary = build_training_results_summary(training_results)
+    forecast_summary = build_forecast_summary(forecast_frame)
+    prompt = build_simulation_summary_prompt(training_summary, forecast_summary)
+
+    try:
+        with st.spinner("Generating local LLM summary..."):
+            summary_text = get_cached_simulation_summary(
+                prompt=prompt,
+                model_name=model_name,
+                endpoint_url=endpoint_url,
+            )
+    except LocalLlmError as exc:
+        st.warning(
+            f"Local LLM unavailable: {exc} "
+            "The dashboard still works without the explanation layer."
+        )
+        return
+
+    st.write(summary_text)
 
 
 def build_simulation_start_timestamp(start_date: object) -> str:
@@ -676,6 +801,9 @@ def render_simulation_ml_view(study_area_sites: pd.DataFrame) -> None:
                 f"{pd.Timestamp(forecast_end).strftime('%Y-%m-%d %H:%M')}"
             )
         render_forecast_results(forecast_frame)
+
+    if training_results is not None:
+        render_llm_simulation_summary(training_results, forecast_frame)
 
 
 def main() -> None:
