@@ -139,7 +139,7 @@ def build_simulation_summary_prompt(
         "You are helping explain a research prototype for RAN energy forecasting.\n"
         "Write exactly two short paragraphs in plain English.\n"
         "Paragraph 1 must summarize model training quality.\n"
-        "Paragraph 2 must summarize forecast trends.\n"
+        "Paragraph 2 must summarize forecast trends and also it needs to show the numbers for each date you are refering to, maybe averages.\n"
         "Mention that the data is simulated.\n"
         "Do not invent values or recommendations.\n"
         "Keep the full answer under 140 words.\n\n"
